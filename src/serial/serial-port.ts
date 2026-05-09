@@ -19,6 +19,12 @@ let port: SerialPort | null = null
 let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
 let abortController: AbortController | null = null
 
+function handlePortDisconnect(event: Event): void {
+  if ((event.target as SerialPort | null) === port) {
+    void closePort()
+  }
+}
+
 /** Inter-frame silence timeout in ms (Modbus RTU spec: 3.5 char times) */
 const FRAME_TIMEOUT_MS = 20
 
@@ -45,6 +51,7 @@ export async function openPort(config: SerialConfig): Promise<void> {
     stopBits: config.stopBits,
     parity: config.parity,
   })
+  port.addEventListener('disconnect', handlePortDisconnect)
 
   isOpen.value = true
   abortController = new AbortController()
@@ -55,28 +62,38 @@ export async function openPort(config: SerialConfig): Promise<void> {
  * Close the serial port
  */
 export async function closePort(): Promise<void> {
+  const currentReader = reader
+  const currentPort = port
+
   abortController?.abort()
   abortController = null
+  isOpen.value = false
+  reader = null
+  port = null
 
-  if (reader) {
+  if (currentReader) {
     try {
-      await reader.cancel()
+      await currentReader.cancel()
     } catch {
       // Ignore cancel errors
     }
-    reader = null
+
+    try {
+      currentReader.releaseLock()
+    } catch {
+      // Ignore release errors
+    }
   }
 
-  if (port) {
+  if (currentPort) {
+    currentPort.removeEventListener('disconnect', handlePortDisconnect)
+
     try {
-      await port.close()
+      await currentPort.close()
     } catch {
       // Ignore close errors
     }
-    port = null
   }
-
-  isOpen.value = false
 }
 
 /**
@@ -98,88 +115,109 @@ async function writeToPort(data: Uint8Array): Promise<void> {
  * using inter-frame silence (timeout-based frame detection).
  */
 function startReadLoop(): void {
-  if (!port?.readable) return
+  const currentPort = port
+  const currentAbortController = abortController
 
-  const readable = port.readable
+  if (!currentPort?.readable || !currentAbortController) return
+
+  const readable = currentPort.readable
 
   ;(async () => {
-    while (port && isOpen.value) {
-      try {
-        reader = readable.getReader()
-        let buffer = new Uint8Array(0)
-        let frameTimer: ReturnType<typeof setTimeout> | null = null
+    let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    let buffer = new Uint8Array(0)
+    let frameTimer: ReturnType<typeof setTimeout> | null = null
 
-        const processFrame = async () => {
-          if (buffer.length < 4) {
-            buffer = new Uint8Array(0)
-            return
-          }
+    const closeAfterSerialError = async (err: unknown) => {
+      if (currentAbortController.signal.aborted || port !== currentPort) return
 
-          const frame = buffer
-          buffer = new Uint8Array(0)
+      console.error('Serial port error:', err)
+      await closePort()
+    }
 
-          // Log RX
-          const rxSummary = describeRequest(frame)
-          addLogEntry({
-            timestamp: new Date(),
-            direction: 'RX',
-            rawHex: toHexString(frame),
-            summary: rxSummary,
-          })
+    const processFrame = async () => {
+      if (buffer.length < 4) {
+        buffer = new Uint8Array(0)
+        return
+      }
 
-          // Parse and handle
-          const request = parseRequest(frame)
-          if (!request) return
+      const frame = buffer
+      buffer = new Uint8Array(0)
 
-          // Only respond if the request is addressed to us (or broadcast address 0)
-          if (request.slaveAddress !== store.slaveAddress && request.slaveAddress !== 0) {
-            return
-          }
+      // Log RX
+      const rxSummary = describeRequest(frame)
+      addLogEntry({
+        timestamp: new Date(),
+        direction: 'RX',
+        rawHex: toHexString(frame),
+        summary: rxSummary,
+      })
 
-          // Don't respond to broadcast writes (address 0) — just process them silently
-          const response = handleRequest(request)
+      // Parse and handle
+      const request = parseRequest(frame)
+      if (!request) return
 
-          if (request.slaveAddress !== 0) {
-            // Log TX
-            addLogEntry({
-              timestamp: new Date(),
-              direction: 'TX',
-              rawHex: toHexString(response),
-              summary: describeResponse(request, response),
+      // Only respond if the request is addressed to us (or broadcast address 0)
+      if (request.slaveAddress !== store.slaveAddress && request.slaveAddress !== 0) {
+        return
+      }
+
+      // Don't respond to broadcast writes (address 0) — just process them silently
+      const response = handleRequest(request)
+
+      if (request.slaveAddress !== 0) {
+        // Log TX
+        addLogEntry({
+          timestamp: new Date(),
+          direction: 'TX',
+          rawHex: toHexString(response),
+          summary: describeResponse(request, response),
+        })
+
+        await writeToPort(response)
+      }
+    }
+
+    try {
+      reader = readable.getReader()
+      activeReader = reader
+
+      while (port === currentPort && isOpen.value) {
+        const { value, done } = await activeReader.read()
+        if (done) break
+
+        if (value && value.length > 0) {
+          // Append to buffer
+          const newBuffer = new Uint8Array(buffer.length + value.length)
+          newBuffer.set(buffer)
+          newBuffer.set(value, buffer.length)
+          buffer = newBuffer
+
+          // Reset frame timer
+          if (frameTimer) clearTimeout(frameTimer)
+          frameTimer = setTimeout(() => {
+            void processFrame().catch((err) => {
+              void closeAfterSerialError(err)
             })
+          }, FRAME_TIMEOUT_MS)
+        }
+      }
 
-            await writeToPort(response)
-          }
+      if (!currentAbortController.signal.aborted && port === currentPort && isOpen.value) {
+        await closePort()
+      }
+    } catch (err) {
+      await closeAfterSerialError(err)
+    } finally {
+      if (frameTimer) clearTimeout(frameTimer)
+
+      if (activeReader) {
+        try {
+          activeReader.releaseLock()
+        } catch {
+          // Ignore release errors
         }
 
-        while (true) {
-          const { value, done } = await reader.read()
-          if (done) break
-
-          if (value && value.length > 0) {
-            // Append to buffer
-            const newBuffer = new Uint8Array(buffer.length + value.length)
-            newBuffer.set(buffer)
-            newBuffer.set(value, buffer.length)
-            buffer = newBuffer
-
-            // Reset frame timer
-            if (frameTimer) clearTimeout(frameTimer)
-            frameTimer = setTimeout(() => processFrame(), FRAME_TIMEOUT_MS)
-          }
-        }
-
-        if (frameTimer) clearTimeout(frameTimer)
-      } catch (err) {
-        if (abortController?.signal.aborted) break
-        console.error('Serial read error:', err)
-      } finally {
-        if (reader) {
-          try {
-            reader.releaseLock()
-          } catch {
-            // Ignore
-          }
+        if (reader === activeReader) {
           reader = null
         }
       }
