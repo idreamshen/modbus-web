@@ -15,6 +15,10 @@
         Web Serial API is not supported in this browser. Please use Chrome, Edge, or Opera.
       </v-alert>
 
+      <v-alert v-if="masterOpen" type="warning" variant="tonal" density="compact" class="mb-4">
+        RTU Master is using a serial port. Disconnect Master first before using Slave.
+      </v-alert>
+
       <v-row dense>
         <v-col cols="6">
           <v-select
@@ -71,7 +75,7 @@
         v-if="!isOpen"
         color="primary"
         variant="flat"
-        :disabled="!serialSupported"
+        :disabled="!serialSupported || masterOpen"
         @click="handleConnect"
         :loading="connecting"
         prepend-icon="mdi-connection"
@@ -98,6 +102,7 @@
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
 import { openPort, closePort, isOpen, isSerialSupported } from '../serial/serial-port'
+import { isRtuMasterOpen as masterOpen } from '../master/rtu-master'
 import { store } from '../store/registers'
 import type { SerialConfig } from '../serial/serial-port'
 
@@ -117,6 +122,12 @@ const showError = ref(false)
 const errorMessage = ref('')
 
 async function handleConnect() {
+  if (masterOpen.value) {
+    errorMessage.value = 'RTU Master is already connected. Disconnect Master first.'
+    showError.value = true
+    return
+  }
+
   connecting.value = true
   try {
     await openPort(config)

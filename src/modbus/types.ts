@@ -6,6 +6,23 @@ export enum FunctionCode {
   WriteMultipleRegisters = 0x10,
 }
 
+export type MasterProtocol = 'rtu' | 'tcp'
+
+export interface ModbusMasterResult {
+  ok: boolean
+  unitId?: number
+  slaveId?: number
+  transactionId?: number
+  functionCode?: number
+  values?: number[]
+  address?: number
+  value?: number
+  quantity?: number
+  exceptionCode?: number
+  exceptionName?: string
+  error?: string
+}
+
 /** Parsed Modbus RTU request */
 export interface ModbusRequest {
   slaveAddress: number
@@ -22,6 +39,8 @@ export interface CommLogEntry {
   direction: 'RX' | 'TX'
   rawHex: string
   summary: string
+  role?: 'slave' | 'master'
+  protocol?: MasterProtocol
 }
 
 /** Register definition with metadata (for UI display) */

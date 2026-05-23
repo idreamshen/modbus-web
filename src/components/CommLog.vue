@@ -25,6 +25,9 @@
           <span class="log-dir" :class="entry.direction === 'RX' ? 'text-blue' : 'text-green'">
             {{ entry.direction }}
           </span>
+          <span v-if="entry.role || entry.protocol" class="log-meta">
+            [{{ entry.role ?? '-' }}{{ entry.protocol ? '/' + entry.protocol.toUpperCase() : '' }}]
+          </span>
           <span class="log-hex">{{ entry.rawHex }}</span>
           <span class="log-summary text-grey">{{ entry.summary }}</span>
         </div>
@@ -103,6 +106,11 @@ watch(
   font-weight: bold;
   display: inline-block;
   width: 24px;
+}
+
+.log-meta {
+  margin-right: 8px;
+  color: #bdbdbd;
 }
 
 .log-hex {
